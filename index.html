@@ -450,6 +450,24 @@
       </div>
     </div>
   </div>
+
+  <!-- 智能分发视图 -->
+  <div id="distView" style="display:none">
+    <div class="section">
+      <div class="section-title">智能分发</div>
+      <div class="hint" style="margin-bottom:12px;margin-top:0">粘贴一批密钥，系统会自动用所有已配置接口的分组逐个测试，第一个测试通过的分组即为归入目标。全部失败则剔除。</div>
+      <textarea id="distInput" aria-label="密钥输入" placeholder="粘贴 API 密钥，每行一个&#10;支持原始密钥和 Base64 编码的密钥"></textarea>
+      <div class="btn-row">
+        <button class="btn-primary" id="btnDistribute" onclick="handleDistribute()">开始分发</button>
+        <button class="btn-secondary" onclick="document.getElementById('distInput').value=''">清空输入</button>
+      </div>
+    </div>
+    <div class="section" id="distResultSection" style="display:none">
+      <div class="section-title">分发结果</div>
+      <div class="stats" id="distSummary"></div>
+      <div class="key-list" id="distResultList"></div>
+    </div>
+  </div>
 </div>
 </main>
 
@@ -482,10 +500,11 @@
 // ─── State ───────────────────────────────────────────────────
 const ALL_VIEW = '__all__';
 const STATS_VIEW = '__stats__';
+const DIST_VIEW = '__dist__';
 const state = { groups: [], activeGroupId: null, testResults: {}, allKeys: [], stats: null };
 let rendering = false;
 
-function isVirtual(id) { return id === ALL_VIEW || id === STATS_VIEW; }
+function isVirtual(id) { return id === ALL_VIEW || id === STATS_VIEW || id === DIST_VIEW; }
 
 // ─── API ─────────────────────────────────────────────────────
 async function apiFetch(path, options = {}) {
@@ -507,7 +526,7 @@ async function refreshGroups() {
         state.groups = await apiFetch('/api/groups');
     }
     const saved = localStorage.getItem('activeGroupId');
-    if (saved === ALL_VIEW || saved === STATS_VIEW) {
+    if (saved === ALL_VIEW || saved === STATS_VIEW || saved === DIST_VIEW) {
         state.activeGroupId = saved;
     } else {
         const savedId = parseInt(saved);
@@ -579,6 +598,9 @@ function render() {
     const addSection = document.getElementById('addSection');
     const listSection = document.getElementById('listSection');
     const statsView = document.getElementById('statsView');
+    const distView = document.getElementById('distView');
+
+    distView.style.display = 'none';
 
     if (view === STATS_VIEW) {
         protocolBar.style.display = 'none';
@@ -586,6 +608,15 @@ function render() {
         listSection.style.display = 'none';
         statsView.style.display = 'block';
         renderStats();
+        return;
+    }
+
+    if (view === DIST_VIEW) {
+        protocolBar.style.display = 'none';
+        addSection.style.display = 'none';
+        listSection.style.display = 'none';
+        statsView.style.display = 'none';
+        distView.style.display = '';
         return;
     }
 
@@ -624,7 +655,11 @@ function renderTabs() {
         aria-selected="${isActive(STATS_VIEW)}" tabindex="${isActive(STATS_VIEW) ? '0' : '-1'}">
         统计
     </div>`;
-    el.innerHTML = statsTab + allTab + groupsHtml + '<button class="tab-add" id="btnAddGroup">+ 新建分组</button>';
+    const distTab = `<div role="tab" class="tab virtual ${isActive(DIST_VIEW) ? 'active' : ''}" data-group-id="${DIST_VIEW}"
+        aria-selected="${isActive(DIST_VIEW)}" tabindex="${isActive(DIST_VIEW) ? '0' : '-1'}">
+        智能分发
+    </div>`;
+    el.innerHTML = statsTab + distTab + allTab + groupsHtml + '<button class="tab-add" id="btnAddGroup">+ 新建分组</button>';
 
     el.onclick = (e) => {
         if (e.target.closest('.tab-del')) return;
@@ -1023,6 +1058,73 @@ async function handleRemoveFailed() {
     } finally {
         btn.disabled = false;
         btn.textContent = '一键剔除失败';
+    }
+}
+
+// ─── Distribute ─────────────────────────────────────────────
+async function handleDistribute() {
+    const btn = document.getElementById('btnDistribute');
+    const raw = document.getElementById('distInput').value;
+    if (!raw.trim()) { showToast('请输入密钥'); return; }
+    const keyLines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+    if (keyLines.length === 0) { showToast('没有有效的密钥'); return; }
+
+    const prevText = btn.textContent;
+    btn.classList.add('btn-loading');
+    btn.textContent = '分发中…';
+    document.getElementById('distResultSection').style.display = 'none';
+    try {
+        const result = await apiFetch('/api/distribute', {
+            method: 'POST', body: JSON.stringify({ keys: keyLines })
+        });
+        await refreshGroups();
+
+        // Render summary
+        const summaryEl = document.getElementById('distSummary');
+        const parts = [`总计 <span>${result.total}</span> 条`];
+        parts.push(`成功 <span>${result.success}</span> 条`);
+        parts.push(`失败 <span>${result.failed}</span> 条`);
+        if (result.skipped_dup > 0) parts.push(`重复跳过 <span>${result.skipped_dup}</span> 条`);
+        summaryEl.innerHTML = parts.map(p => `<div class="stat">${p}</div>`).join('');
+
+        // Render result list
+        const listEl = document.getElementById('distResultList');
+        if (result.distribution.length > 0) {
+            let html = result.distribution.map(d =>
+                `<div class="key-item">
+                    <span class="status-dot success"></span>
+                    <span class="key-group-tag">${escHtml(d.name)}</span>
+                    <span class="key-text" style="font-size:12px;color:var(--text-secondary)">归入 ${escHtml(d.name)} — ${d.count} 条</span>
+                </div>`
+            ).join('');
+            if (result.failed > 0) {
+                html += `<div class="key-item">
+                    <span class="status-dot fail"></span>
+                    <span class="key-text" style="font-size:12px;color:var(--danger)">全部分组测试失败 — ${result.failed} 条未归入</span>
+                </div>`;
+            }
+            listEl.innerHTML = html;
+        } else if (result.failed > 0) {
+            listEl.innerHTML = `<div class="key-item">
+                <span class="status-dot fail"></span>
+                <span class="key-text" style="font-size:12px;color:var(--danger)">所有密钥在所有分组中均测试失败 — ${result.failed} 条</span>
+            </div>`;
+        } else {
+            listEl.innerHTML = '<div class="empty">无有效密钥</div>';
+        }
+        document.getElementById('distResultSection').style.display = '';
+        document.getElementById('distInput').value = '';
+
+        if (result.success > 0) {
+            showToast(`分发完成：${result.success} 条成功，${result.failed} 条失败`);
+        } else {
+            showToast(`分发完成：全部失败，未归入任何分组`);
+        }
+    } catch (e) {
+        showToast('分发失败: ' + e.message);
+    } finally {
+        btn.classList.remove('btn-loading');
+        btn.textContent = prevText;
     }
 }
 

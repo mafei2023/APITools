@@ -585,6 +585,106 @@ def get_test_results():
 
 # ─── Health ─────────────────────────────────────────────────
 
+@app.route('/api/distribute', methods=['POST'])
+def distribute_keys():
+    """智能分发：对每条密钥依次测试所有有 protocol 的分组，第一个通过就归入。"""
+    data = request.json
+    raw_keys = data.get('keys', [])
+    if not raw_keys:
+        return jsonify({'error': '没有有效的密钥'}), 400
+
+    conn = get_db()
+    groups = conn.execute('SELECT * FROM groups ORDER BY id').fetchall()
+    testable = [(g['id'], g['protocol'], g['model'] or '') for g in groups if (g['protocol'] or '').strip()]
+    if not testable:
+        conn.close()
+        return jsonify({'error': '没有任何分组配置了接口协议，无法测试分发'}), 400
+
+    # Collect all existing keys per group for dedup
+    existing_per_group = {}
+    for g in groups:
+        rows = conn.execute('SELECT api_key FROM keys WHERE group_id=?', (g['id'],)).fetchall()
+        existing_per_group[g['id']] = {r['api_key'] for r in rows}
+    conn.close()
+
+    # Normalize keys
+    normalized = []
+    skipped_dup = 0
+    for raw in raw_keys:
+        k = _normalize_key(raw)
+        if not k:
+            continue
+        normalized.append(k)
+
+    # For each key, test groups sequentially until one passes
+    results = []  # {api_key, status: 'ok'|'fail', group_id?, group_name?, latency?, error?}
+    group_name_map = {g['id']: g['name'] for g in groups}
+
+    # We test keys one by one (sequentially across groups for each key)
+    # but can parallelize across keys since each key's tests are independent
+    def _test_key_groups(api_key):
+        """Test api_key against all testable groups. Return first passing group or None."""
+        for gid, protocol, model in testable:
+            if api_key in existing_per_group.get(gid, set()):
+                continue  # skip groups that already have this key
+            res = _do_test(protocol, api_key, model)
+            if res['ok']:
+                return {'group_id': gid, 'group_name': group_name_map[gid], **res}
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(len(normalized), 20)) as executor:
+        future_map = {executor.submit(_test_key_groups, k): k for k in normalized}
+        key_results = {}
+        for future in as_completed(future_map):
+            k = future_map[future]
+            key_results[k] = future.result()
+
+    # Write results to DB
+    conn = get_db()
+    success_count = 0
+    fail_count = 0
+    fail_keys = []
+    dist_map = {}  # group_name -> count
+
+    for k in normalized:
+        match = key_results.get(k)
+        if match:
+            gid = match['group_id']
+            try:
+                conn.execute('INSERT INTO keys (group_id, api_key) VALUES (?, ?)', (gid, k))
+                conn.execute('INSERT INTO add_events (api_key, group_id) VALUES (?, ?)', (k, gid))
+            except sqlite3.IntegrityError:
+                skipped_dup += 1
+                continue
+            conn.execute(
+                'INSERT INTO test_results (api_key, ok, latency, error, protocol, model) VALUES (?,?,?,?,?,?)',
+                (k, 1, match['latency'], match['error'],
+                 [p for i, p, m in testable if i == gid][0],
+                 [m for i, p, m in testable if i == gid][0])
+            )
+            gname = match['group_name']
+            dist_map[gname] = dist_map.get(gname, 0) + 1
+            success_count += 1
+            results.append({'api_key': k, 'status': 'ok', 'group_id': gid, 'group_name': gname,
+                            'latency': match['latency']})
+        else:
+            fail_count += 1
+            fail_keys.append(k)
+            results.append({'api_key': k, 'status': 'fail'})
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        'total': len(normalized),
+        'success': success_count,
+        'failed': fail_count,
+        'skipped_dup': skipped_dup,
+        'distribution': [{'name': n, 'count': c} for n, c in dist_map.items()],
+        'failed_keys': fail_keys,
+    })
+
+
 @app.route('/api/ping')
 def ping():
     return 'pong'
