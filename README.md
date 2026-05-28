@@ -1,5 +1,7 @@
 # API Key Manager
 
+[简体中文](README.md) | [English](README.en.md) | [繁体中文](README.zh-TW.md) | [日本語](README.ja.md)
+
 一个本地运行的 API 密钥管理工具，帮助开发者快速批量导入、分组、测试和清理 API 密钥。
 
 ## 功能特性
@@ -62,4 +64,4 @@ APITools/
 
 ## 许可证
 
-MIT   用
+MIT
