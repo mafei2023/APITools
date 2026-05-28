@@ -62,6 +62,10 @@ APITools/
 3. **Check Status** — View global stats on the dashboard, or drill into individual key details per group
 4. **Clean Up** — One-click removal of failed keys to keep things tidy
 
+## Friends
+
+- [LINUX DO](https://linux.do) — A Linux and open-source tech community
+
 ## License
 
 MIT
